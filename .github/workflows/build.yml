@@ -1,0 +1,619 @@
+name: build
+on: [push, workflow_dispatch]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: 生成项目
+        run: |
+          mkdir -p app/src/main/java/com/duo/browser
+          cat > settings.gradle << 'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "DuoBrowser"
+          include ':app'
+          EOF
+          cat > build.gradle << 'EOF'
+          plugins { id 'com.android.application' version '8.5.0' apply false }
+          EOF
+          cat > gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          EOF
+          cat > app/build.gradle << 'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.duo.browser'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.duo.browser'
+                  minSdk 21
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+                  encoding 'UTF-8'
+              }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
+              <application
+                  android:label="多少浏览器"
+                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:allowBackup="false"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout|uiMode"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.VIEW" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <category android:name="android.intent.category.BROWSABLE" />
+                          <data android:scheme="http" />
+                          <data android:scheme="https" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/duo/browser/MainActivity.java << 'EOF'
+          package com.duo.browser;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.app.DownloadManager;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.IntentFilter;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.database.Cursor;
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Paint;
+          import android.graphics.Path;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.os.SystemClock;
+          import android.provider.Settings;
+          import android.view.Gravity;
+          import android.view.InputDevice;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.inputmethod.EditorInfo;
+          import android.view.inputmethod.InputMethodManager;
+          import android.webkit.CookieManager;
+          import android.webkit.URLUtil;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebStorage;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.FrameLayout;
+          import android.widget.LinearLayout;
+          import android.widget.ProgressBar;
+          import android.widget.Toast;
+          import java.net.URLEncoder;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.HashSet;
+          import java.util.List;
+          import java.util.Set;
+
+          public class MainActivity extends Activity {
+              static final String HOME = "https://www.baidu.com";
+              static final String DESK_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+              static final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT;
+              static final int WRAP = ViewGroup.LayoutParams.WRAP_CONTENT;
+
+              WebView web;
+              EditText urlBox;
+              ProgressBar bar;
+              CursorView cursor;
+              SharedPreferences sp;
+              boolean desktop = false;
+              final float[] speeds = {1.0f, 1.6f, 2.4f};
+              final String[] speedNames = {"慢", "中", "快"};
+              int speedIdx = 1;
+
+              int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+              }
+
+              Button barBtn(String text, View.OnClickListener l) {
+                  Button b = new Button(this);
+                  b.setText(text);
+                  b.setTextSize(14);
+                  b.setAllCaps(false);
+                  b.setBackgroundColor(Color.TRANSPARENT);
+                  b.setOnClickListener(l);
+                  return b;
+              }
+
+              LinearLayout.LayoutParams weight() {
+                  return new LinearLayout.LayoutParams(0, dp(48), 1f);
+              }
+
+              @Override
+              protected void onCreate(Bundle saved) {
+                  super.onCreate(saved);
+                  sp = getSharedPreferences("duo", MODE_PRIVATE);
+                  speedIdx = sp.getInt("speed", 1);
+                  boolean mouseOn = sp.getBoolean("mouse", true);
+
+                  if (Build.VERSION.SDK_INT >= 23 && Build.VERSION.SDK_INT <= 28
+                          && checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[]{android.Manifest.permission.WRITE_EXTERNAL_STORAGE}, 1);
+                  }
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setBackgroundColor(Color.WHITE);
+                  root.setFitsSystemWindows(true);
+
+                  LinearLayout top = new LinearLayout(this);
+                  top.setOrientation(LinearLayout.HORIZONTAL);
+                  top.setGravity(Gravity.CENTER_VERTICAL);
+                  top.setPadding(dp(6), dp(4), dp(6), dp(4));
+                  urlBox = new EditText(this);
+                  urlBox.setSingleLine(true);
+                  urlBox.setTextSize(14);
+                  urlBox.setHint("输入网址或搜索内容");
+                  urlBox.setImeOptions(EditorInfo.IME_ACTION_GO);
+                  urlBox.setSelectAllOnFocus(true);
+                  urlBox.setOnEditorActionListener((tv, action, ev) -> {
+                      go(urlBox.getText().toString());
+                      return true;
+                  });
+                  top.addView(urlBox, new LinearLayout.LayoutParams(0, WRAP, 1f));
+                  top.addView(barBtn("前往", x -> go(urlBox.getText().toString())),
+                          new LinearLayout.LayoutParams(WRAP, dp(44)));
+                  root.addView(top, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+                  bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+                  bar.setMax(100);
+                  root.addView(bar, new LinearLayout.LayoutParams(MATCH, dp(3)));
+
+                  FrameLayout box = new FrameLayout(this);
+                  web = new WebView(this);
+                  box.addView(web, new FrameLayout.LayoutParams(MATCH, MATCH));
+                  cursor = new CursorView(this, web);
+                  cursor.speed = speeds[speedIdx];
+                  cursor.setVisibility(mouseOn ? View.VISIBLE : View.GONE);
+                  box.addView(cursor, new FrameLayout.LayoutParams(MATCH, MATCH));
+                  root.addView(box, new LinearLayout.LayoutParams(MATCH, 0, 1f));
+
+                  LinearLayout bottom = new LinearLayout(this);
+                  bottom.setOrientation(LinearLayout.HORIZONTAL);
+                  bottom.setBackgroundColor(0xFFF2F2F2);
+                  bottom.addView(barBtn("后退", x -> { if (web.canGoBack()) web.goBack(); }), weight());
+                  bottom.addView(barBtn("前进", x -> { if (web.canGoForward()) web.goForward(); }), weight());
+                  bottom.addView(barBtn("刷新", x -> web.reload()), weight());
+                  bottom.addView(barBtn("主页", x -> web.loadUrl(HOME)), weight());
+                  bottom.addView(barBtn("菜单", x -> showMenu()), weight());
+                  root.addView(bottom, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+                  setContentView(root);
+                  setupWeb();
+
+                  IntentFilter f = new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE);
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      registerReceiver(dlDone, f, Context.RECEIVER_EXPORTED);
+                  } else {
+                      registerReceiver(dlDone, f);
+                  }
+
+                  Uri data = getIntent().getData();
+                  web.loadUrl(data != null ? data.toString() : HOME);
+
+                  if (!sp.getBoolean("hint", false)) {
+                      sp.edit().putBoolean("hint", true).apply();
+                      new AlertDialog.Builder(this)
+                              .setTitle("使用说明")
+                              .setMessage("单指在网页上滑动：移动光标\n轻点一下：点击光标所在位置\n双指上下滑：翻页\n\n菜单里可以关闭虚拟鼠标、调速度。")
+                              .setPositiveButton("知道了", null)
+                              .show();
+                  }
+              }
+
+              void setupWeb() {
+                  WebSettings st = web.getSettings();
+                  st.setJavaScriptEnabled(true);
+                  st.setDomStorageEnabled(true);
+                  st.setSupportZoom(true);
+                  st.setBuiltInZoomControls(true);
+                  st.setDisplayZoomControls(false);
+                  st.setUseWideViewPort(true);
+                  st.setLoadWithOverviewMode(true);
+                  st.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
+
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) {
+                          String u = req.getUrl().toString();
+                          return !(u.startsWith("http://") || u.startsWith("https://"));
+                      }
+
+                      @Override
+                      public void onPageStarted(WebView view, String url, Bitmap icon) {
+                          if (!urlBox.hasFocus()) urlBox.setText(url);
+                      }
+                  });
+                  web.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public void onProgressChanged(WebView view, int p) {
+                          bar.setProgress(p);
+                          bar.setVisibility(p >= 100 ? View.GONE : View.VISIBLE);
+                      }
+                  });
+                  web.setDownloadListener((url, ua, cd, mime, len) -> startDownload(url, ua, cd, mime));
+              }
+
+              void go(String in) {
+                  String t = in.trim();
+                  if (t.isEmpty()) return;
+                  String u;
+                  if (t.startsWith("http://") || t.startsWith("https://")) {
+                      u = t;
+                  } else if (t.contains(".") && !t.contains(" ")) {
+                      u = "https://" + t;
+                  } else {
+                      try {
+                          u = "https://www.baidu.com/s?wd=" + URLEncoder.encode(t, "UTF-8");
+                      } catch (Exception ex) {
+                          return;
+                      }
+                  }
+                  web.loadUrl(u);
+                  web.requestFocus();
+                  InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+                  imm.hideSoftInputFromWindow(urlBox.getWindowToken(), 0);
+              }
+
+              void toast(String s) {
+                  Toast.makeText(this, s, Toast.LENGTH_LONG).show();
+              }
+
+              void startDownload(String url, String ua, String cd, String mime) {
+                  try {
+                      String name = URLUtil.guessFileName(url, cd, mime);
+                      DownloadManager.Request r = new DownloadManager.Request(Uri.parse(url));
+                      String ck = CookieManager.getInstance().getCookie(url);
+                      if (ck != null) r.addRequestHeader("Cookie", ck);
+                      r.addRequestHeader("User-Agent", ua);
+                      r.setTitle(name);
+                      r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                      r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name);
+                      ((DownloadManager) getSystemService(DOWNLOAD_SERVICE)).enqueue(r);
+                      toast("开始下载：" + name);
+                  } catch (Exception ex) {
+                      toast("下载失败：" + ex.getMessage());
+                  }
+              }
+
+              final BroadcastReceiver dlDone = new BroadcastReceiver() {
+                  @Override
+                  public void onReceive(Context c, Intent it) {
+                      long id = it.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1);
+                      DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+                      Cursor cu = dm.query(new DownloadManager.Query().setFilterById(id));
+                      try {
+                          if (cu != null && cu.moveToFirst()) {
+                              int status = cu.getInt(cu.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS));
+                              String title = cu.getString(cu.getColumnIndexOrThrow(DownloadManager.COLUMN_TITLE));
+                              String mime = cu.getString(cu.getColumnIndexOrThrow(DownloadManager.COLUMN_MEDIA_TYPE));
+                              String local = cu.getString(cu.getColumnIndexOrThrow(DownloadManager.COLUMN_LOCAL_URI));
+                              if (status != DownloadManager.STATUS_SUCCESSFUL) {
+                                  toast("下载失败：" + title);
+                                  return;
+                              }
+                              boolean apk = "application/vnd.android.package-archive".equals(mime)
+                                      || (local != null && local.toLowerCase().endsWith(".apk"));
+                              if (apk) {
+                                  askInstall(dm.getUriForDownloadedFile(id), title);
+                              } else {
+                                  toast("下载完成：" + title + "（在 Download 文件夹）");
+                              }
+                          }
+                      } finally {
+                          if (cu != null) cu.close();
+                      }
+                  }
+              };
+
+              void askInstall(final Uri uri, String name) {
+                  new AlertDialog.Builder(this)
+                          .setTitle("下载完成")
+                          .setMessage(name + "\n现在安装吗？")
+                          .setPositiveButton("安装", (dlg, w) -> installApk(uri))
+                          .setNegativeButton("取消", null)
+                          .show();
+              }
+
+              void installApk(Uri uri) {
+                  if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
+                      toast("请先允许本应用安装应用，然后到下载管理里重新点安装");
+                      startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                              Uri.parse("package:" + getPackageName())));
+                      return;
+                  }
+                  Intent i = new Intent(Intent.ACTION_VIEW);
+                  i.setDataAndType(uri, "application/vnd.android.package-archive");
+                  i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+                  try {
+                      startActivity(i);
+                  } catch (Exception ex) {
+                      toast("无法安装，请到 Download 文件夹手动点击安装包");
+                  }
+              }
+
+              void showMenu() {
+                  final boolean on = cursor.getVisibility() == View.VISIBLE;
+                  String[] items = {
+                          on ? "关闭虚拟鼠标" : "开启虚拟鼠标",
+                          "鼠标速度：" + speedNames[speedIdx] + "（点击切换）",
+                          "添加书签",
+                          "书签列表",
+                          desktop ? "切换为手机版网页" : "切换为电脑版网页",
+                          "下载管理",
+                          "清除缓存和历史",
+                          "退出"
+                  };
+                  new AlertDialog.Builder(this).setItems(items, (dlg, which) -> {
+                      switch (which) {
+                          case 0:
+                              cursor.setVisibility(on ? View.GONE : View.VISIBLE);
+                              sp.edit().putBoolean("mouse", !on).apply();
+                              toast(on ? "虚拟鼠标已关闭" : "虚拟鼠标已开启");
+                              break;
+                          case 1:
+                              speedIdx = (speedIdx + 1) % 3;
+                              cursor.speed = speeds[speedIdx];
+                              sp.edit().putInt("speed", speedIdx).apply();
+                              toast("鼠标速度：" + speedNames[speedIdx]);
+                              break;
+                          case 2:
+                              addBookmark();
+                              break;
+                          case 3:
+                              showBookmarks();
+                              break;
+                          case 4:
+                              desktop = !desktop;
+                              web.getSettings().setUserAgentString(desktop ? DESK_UA : null);
+                              web.reload();
+                              break;
+                          case 5:
+                              startActivity(new Intent(DownloadManager.ACTION_VIEW_DOWNLOADS));
+                              break;
+                          case 6:
+                              web.clearCache(true);
+                              web.clearHistory();
+                              CookieManager.getInstance().removeAllCookies(null);
+                              WebStorage.getInstance().deleteAllData();
+                              toast("已清除");
+                              break;
+                          default:
+                              finish();
+                      }
+                  }).show();
+              }
+
+              void addBookmark() {
+                  String url = web.getUrl();
+                  String title = web.getTitle();
+                  if (url == null) return;
+                  if (title == null || title.isEmpty()) title = url;
+                  Set<String> set = new HashSet<String>(sp.getStringSet("bm", new HashSet<String>()));
+                  set.add(title.replace("\t", " ") + "\t" + url);
+                  sp.edit().putStringSet("bm", set).apply();
+                  toast("已添加书签");
+              }
+
+              void showBookmarks() {
+                  final List<String> list = new ArrayList<String>(sp.getStringSet("bm", new HashSet<String>()));
+                  if (list.isEmpty()) {
+                      toast("还没有书签");
+                      return;
+                  }
+                  Collections.sort(list);
+                  String[] names = new String[list.size()];
+                  for (int n = 0; n < names.length; n++) names[n] = list.get(n).split("\t")[0];
+                  new AlertDialog.Builder(this)
+                          .setTitle("书签")
+                          .setItems(names, (dlg, idx) -> {
+                              String[] p = list.get(idx).split("\t");
+                              if (p.length > 1) web.loadUrl(p[1]);
+                          })
+                          .setNeutralButton("清空", (dlg, w) -> sp.edit().remove("bm").apply())
+                          .show();
+              }
+
+              @Override
+              protected void onNewIntent(Intent it) {
+                  super.onNewIntent(it);
+                  if (it.getData() != null) web.loadUrl(it.getData().toString());
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (web.canGoBack()) web.goBack();
+                  else super.onBackPressed();
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  web.onPause();
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  web.onResume();
+              }
+
+              @Override
+              protected void onDestroy() {
+                  try {
+                      unregisterReceiver(dlDone);
+                  } catch (Exception ex) {
+                  }
+                  web.destroy();
+                  super.onDestroy();
+              }
+
+              static class CursorView extends View {
+                  final WebView web;
+                  float cx = -1, cy = -1, speed = 1.6f;
+                  float lastX, lastY, downX, downY, lastMidY;
+                  long downT;
+                  boolean multi;
+                  final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  final Paint line = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  final Path arrow = new Path();
+                  final float d;
+
+                  CursorView(Context c, WebView w) {
+                      super(c);
+                      web = w;
+                      d = c.getResources().getDisplayMetrics().density;
+                      fill.setColor(Color.WHITE);
+                      fill.setStyle(Paint.Style.FILL);
+                      line.setColor(Color.BLACK);
+                      line.setStyle(Paint.Style.STROKE);
+                      line.setStrokeWidth(2 * d);
+                      line.setStrokeJoin(Paint.Join.ROUND);
+                  }
+
+                  @Override
+                  protected void onSizeChanged(int w, int h, int ow, int oh) {
+                      if (cx < 0) {
+                          cx = w / 2f;
+                          cy = h / 2f;
+                      }
+                      cx = Math.min(cx, w);
+                      cy = Math.min(cy, h);
+                  }
+
+                  @Override
+                  protected void onDraw(Canvas c) {
+                      if (cx < 0) return;
+                      arrow.reset();
+                      arrow.moveTo(cx, cy);
+                      arrow.lineTo(cx, cy + 20 * d);
+                      arrow.lineTo(cx + 5 * d, cy + 15.5f * d);
+                      arrow.lineTo(cx + 9 * d, cy + 23 * d);
+                      arrow.lineTo(cx + 12 * d, cy + 21.5f * d);
+                      arrow.lineTo(cx + 8 * d, cy + 14 * d);
+                      arrow.lineTo(cx + 14 * d, cy + 14 * d);
+                      arrow.close();
+                      c.drawPath(arrow, fill);
+                      c.drawPath(arrow, line);
+                  }
+
+                  @Override
+                  public boolean onTouchEvent(MotionEvent e) {
+                      switch (e.getActionMasked()) {
+                          case MotionEvent.ACTION_DOWN:
+                              lastX = downX = e.getX();
+                              lastY = downY = e.getY();
+                              downT = e.getEventTime();
+                              multi = false;
+                              return true;
+                          case MotionEvent.ACTION_POINTER_DOWN:
+                              multi = true;
+                              if (e.getPointerCount() >= 2) lastMidY = (e.getY(0) + e.getY(1)) / 2f;
+                              return true;
+                          case MotionEvent.ACTION_MOVE:
+                              if (e.getPointerCount() >= 2) {
+                                  multi = true;
+                                  float my = (e.getY(0) + e.getY(1)) / 2f;
+                                  web.scrollBy(0, (int) (lastMidY - my));
+                                  lastMidY = my;
+                              } else if (!multi) {
+                                  cx = Math.max(0, Math.min(getWidth(), cx + (e.getX() - lastX) * speed));
+                                  cy = Math.max(0, Math.min(getHeight(), cy + (e.getY() - lastY) * speed));
+                                  lastX = e.getX();
+                                  lastY = e.getY();
+                                  invalidate();
+                              }
+                              return true;
+                          case MotionEvent.ACTION_UP:
+                              if (!multi && e.getEventTime() - downT < 300
+                                      && Math.abs(e.getX() - downX) < 10 * d
+                                      && Math.abs(e.getY() - downY) < 10 * d) {
+                                  click();
+                              }
+                              return true;
+                          default:
+                              return true;
+                      }
+                  }
+
+                  void click() {
+                      long t = SystemClock.uptimeMillis();
+                      MotionEvent dn = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, cx, cy, 0);
+                      dn.setSource(InputDevice.SOURCE_TOUCHSCREEN);
+                      web.dispatchTouchEvent(dn);
+                      dn.recycle();
+                      final MotionEvent up = MotionEvent.obtain(t, t + 40, MotionEvent.ACTION_UP, cx, cy, 0);
+                      up.setSource(InputDevice.SOURCE_TOUCHSCREEN);
+                      postDelayed(() -> {
+                          web.dispatchTouchEvent(up);
+                          up.recycle();
+                      }, 40);
+                  }
+              }
+          }
+          EOF
+      - name: 编译
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: duo-browser
+          path: app/build/outputs/apk/debug/app-debug.apk
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: 多少浏览器 ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
